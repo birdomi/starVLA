@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Single-node training. Override these from the shell if needed:
-#   CUDA_VISIBLE_DEVICES=4,5,6,7 NUM_PROCESSES=4 bash examples/LIBERO/train_files/run_libero_train.sh
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 NUM_PROCESSES=4 bash examples/LIBERO/train_files/run_libero_train_learnable_prompt.sh
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 
 # Keep NCCL local and predictable for single-node runs.
@@ -19,15 +19,16 @@ export WANDB_MODE=${WANDB_MODE:-disabled}
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
 Framework_name=${Framework_name:-QwenGR00T}
-freeze_module_list=''
+freeze_module_list='qwen_vl_interface'
 base_vlm=${base_vlm:-playground/Pretrained_models/Qwen3.5-2B}
 config_yaml=${config_yaml:-./examples/LIBERO/train_files/starvla_cotrain_libero.yaml}
 libero_data_root=${libero_data_root:-playground/Datasets/LEROBOT_LIBERO_DATA}
 data_mix=${data_mix:-libero_all}
 run_root_dir=${run_root_dir:-./playground/Checkpoints}
-run_id=${run_id:-libero4in1_qwen3_5_groot}
+run_id=${run_id:-libero4in1_qwen3oft}
 per_device_batch_size=${per_device_batch_size:-64}
 video_backend=${video_backend:-torchcodec}
+max_train_steps=${max_train_steps:-30000}
 # === End of environment variable configuration ===
 ###########################################################################################
 
@@ -43,6 +44,7 @@ PY
 
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --main_process_port "${MAIN_PROCESS_PORT:-29500}" \
   --num_processes "${num_processes}" \
   starVLA/training/train_starvla.py \
   --config_yaml "${config_yaml}" \
@@ -53,7 +55,7 @@ accelerate launch \
   --datasets.vla_data.per_device_batch_size "${per_device_batch_size}" \
   --datasets.vla_data.video_backend "${video_backend}" \
   --trainer.freeze_modules "${freeze_module_list}" \
-  --trainer.max_train_steps 30000 \
+  --trainer.max_train_steps "${max_train_steps}" \
   --trainer.save_interval 10000 \
   --trainer.logging_frequency 100 \
   --trainer.eval_interval 100 \

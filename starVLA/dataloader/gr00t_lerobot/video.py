@@ -17,8 +17,15 @@
 import av
 import cv2
 import numpy as np
+import warnings
 
 import torch  # noqa: F401 # isort: skip
+
+warnings.filterwarnings(
+    "ignore",
+    message="The video decoding and encoding capabilities of torchvision are deprecated.*",
+    category=UserWarning,
+)
 import torchvision  # noqa: F401 # isort: skip
 
 # Import decord with graceful fallback

@@ -67,6 +67,17 @@ LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT_STATS_FORMAT_VERSION = 2
 EPSILON = 5e-4
+DEFAULT_TACTILE_FINGERTIP_INDICES = (2, 4, 6, 8, 10)
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    try:
+        return cfg.get(key, default)
+    except AttributeError:
+        return getattr(cfg, key, default)
+
 
 #  LeRobot v3.0 dataset file names 
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
@@ -593,6 +604,7 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self.robot_data_config = kwargs.get("robot_data_config", None)
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
@@ -1413,7 +1425,47 @@ class LeRobotSingleDataset(Dataset):
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 sample["state"] = state
 
+        tactile_keys = self.modality_keys.get("tactile", [])
+        if tactile_keys:
+            sample["joint_contact"] = self._pack_joint_contact(data, tactile_keys)
+
         return sample
+
+
+    def _get_fingertip_sensor_indices(self) -> np.ndarray:
+        indices = _cfg_get(self.data_cfg, "tactile_fingertip_indices", None)
+        if indices is None:
+            indices = _cfg_get(self.data_cfg, "fingertip_sensor_indices", None)
+        if indices is None:
+            indices = _cfg_get(
+                self.robot_data_config,
+                "tactile_fingertip_indices",
+                DEFAULT_TACTILE_FINGERTIP_INDICES,
+            )
+        return np.asarray(indices, dtype=np.int64)
+
+    def _pack_joint_contact(self, data: dict, tactile_keys: Sequence[str]) -> np.ndarray:
+        fingertip_indices = self._get_fingertip_sensor_indices()
+        hand_contacts = []
+
+        for tactile_key in tactile_keys:
+            tactile = np.asarray(data[tactile_key], dtype=np.float32)
+            if tactile.ndim != 2:
+                raise ValueError(f"Expected tactile {tactile_key} shape [T, D], got {tactile.shape}.")
+            if tactile.shape[-1] % 3 != 0:
+                raise ValueError(f"Expected tactile {tactile_key} dim divisible by 3, got {tactile.shape}.")
+
+            tactile = tactile.reshape(tactile.shape[0], tactile.shape[-1] // 3, 3)
+            if fingertip_indices.size == 0 or fingertip_indices.max() >= tactile.shape[1]:
+                raise ValueError(
+                    f"Invalid fingertip indices {fingertip_indices.tolist()} "
+                    f"for tactile {tactile_key} with {tactile.shape[1]} sensors."
+                )
+            hand_contacts.append(tactile[:, fingertip_indices, :])
+
+        if not hand_contacts:
+            raise ValueError("No tactile keys found to build joint_contact.")
+        return np.concatenate(hand_contacts, axis=1).astype(np.float32)
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -1743,6 +1795,39 @@ class LeRobotSingleDataset(Dataset):
             # padding_strategy="zero",           # HACK for realdata
         )
 
+
+    def get_tactile(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
+        step_indices = self.delta_indices[key] + base_index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = self.trajectory_lengths[trajectory_index]
+
+        assert key.startswith("tactile."), f"Tactile key must start with 'tactile.', got {key}"
+        subkey = key.replace("tactile.", "", 1)
+        tactile_meta = self.lerobot_modality_meta.tactile
+        if tactile_meta is None or subkey not in tactile_meta:
+            raise ValueError(f"Tactile key {key} not found in modality metadata.")
+
+        le_tactile_cfg = tactile_meta[subkey]
+        le_key = le_tactile_cfg.original_key or key
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+
+        data_array = np.stack(self.curr_traj_data[le_key]).astype(np.float32)
+        assert data_array.ndim == 2, f"Expected 2D tactile array, got key {le_key} is {data_array.shape} array"
+        data_array = data_array[:, le_tactile_cfg.start : le_tactile_cfg.end]
+
+        return self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="zero",
+        )
+
     def get_language(
         self,
         trajectory_id: int,
@@ -1817,6 +1902,8 @@ class LeRobotSingleDataset(Dataset):
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
+        elif modality == "tactile":
+            return self.get_tactile(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
 

@@ -72,6 +72,7 @@ def make_LeRobotSingleDataset(
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
+        robot_data_config=data_config,
     )
 
 def get_vla_dataset(

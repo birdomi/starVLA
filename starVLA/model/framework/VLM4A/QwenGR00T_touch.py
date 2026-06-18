@@ -3,8 +3,8 @@
 # Implemented by [Junqiu YU / Fudan University] in [2025].
 # Design and Merged by [Jinhui YE / HKUST University] in [2025].
 """
-Qwen-GR00T Framework
-A lightweight implementation that Qwen-VL + Flow-matching head to directly predict continuous actions
+Qwen-GR00T Touch Framework
+Qwen-VL + AngleTransformer touch tokens + Flow-matching head
 Flow-matching header is copyright from GR00T N1.5,
 """
 
@@ -33,20 +33,23 @@ IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config
-from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingActionHead, get_action_model
+from starVLA.model.modules.action_model.GR00T_ActionHeader_touch import (
+    FlowmatchingActionHeadTouch as FlowmatchingActionHead,
+    get_action_model,
+)
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Default Config for QwenGR00T
+#  Default Config for QwenGR00T_touch
 #  - Documents every framework-level parameter with type + description
 #  - YAML values override these defaults; extra YAML keys are preserved
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
-class QwenGR00TDefaultConfig:
-    """QwenGR00T framework default parameters.
+class QwenGR00TTouchDefaultConfig:
+    """QwenGR00T_touch framework default parameters.
 
     All fields can be overridden by the corresponding key in the YAML
     ``framework:`` section.  Extra YAML keys not listed here are kept
@@ -54,7 +57,7 @@ class QwenGR00TDefaultConfig:
     """
 
     # --- Registry identifier ---
-    name: str = "QwenGR00T"
+    name: str = "QwenGR00T_touch"
 
     # === VLM backbone (Qwen2.5-VL / Qwen3-VL) ===
     qwenvl: dict = field(
@@ -104,6 +107,38 @@ class QwenGR00TDefaultConfig:
             "num_inference_timesteps": 4,
             # Number of vision tokens fed to action head
             "num_target_vision_tokens": 32,
+            # Optional AngleTransformer tactile/angle encoder.
+            "touch": {
+                "enabled": True,
+                "repo_path": "../touch-rep",
+                "model_size": "tiny",
+                "checkpoint_encoder": None,
+                "train_encoder": True,
+                "joint_contact_key": "joint_contact",
+                "finger_angles_key": "finger_angles",
+                "require_touch": True,
+                "derive_finger_angles_from_state": True,
+                "finger_angle_state_indices": [
+                    [7, 8, 8, 8],
+                    [9, 9, 9, 9],
+                    [10, 10, 10, 10],
+                    [11, 11, 11, 11],
+                    [12, 12, 12, 12],
+                    [20, 21, 21, 21],
+                    [22, 22, 22, 22],
+                    [23, 23, 23, 23],
+                    [24, 24, 24, 24],
+                    [25, 25, 25, 25],
+                ],
+                "in_dim": 10,
+                "in_chans": 3,
+                "pos_in_dim": 10,
+                "pos_in_chans": 4,
+                "sequence_length": 1,
+                "time_chunk_size": 1,
+                "num_register_tokens": 1,
+                "token_source": "x_tokens",
+            },
             # === DiT Transformer sub-config ===
             "diffusion_model_cfg": {
                 # Cross-attention dim (aligned to VLM hidden_size at runtime)
@@ -123,8 +158,8 @@ class QwenGR00TDefaultConfig:
     # reduce_in_full_precision: bool = True
 
 
-@FRAMEWORK_REGISTRY.register("QwenGR00T")
-class Qwen_GR00T(baseframework):
+@FRAMEWORK_REGISTRY.register("QwenGR00T_touch")
+class Qwen_GR00T_touch(baseframework):
     """
     Multimodal vision-language-action model (GR00T variant).
 
@@ -149,7 +184,7 @@ class Qwen_GR00T(baseframework):
         """
         super().__init__()
         # Merge framework defaults with YAML config (YAML wins on conflicts)
-        self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
+        self.config = merge_framework_config(QwenGR00TTouchDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
@@ -163,6 +198,80 @@ class Qwen_GR00T(baseframework):
         # are normalised upstream by `share_tools.apply_config_compat`, so we
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+
+    def _read_key(self, obj, key: str):
+        if not key:
+            return None
+        if isinstance(obj, dict) and key in obj:
+            return obj[key]
+        cur = obj
+        for part in key.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
+    def _read_touch_key(self, example: dict, key: str):
+        value = self._read_key(example, key)
+        if value is not None:
+            return value
+        for container_key in ("touch", "tactile"):
+            container = example.get(container_key)
+            if isinstance(container, dict):
+                value = self._read_key(container, key)
+                if value is not None:
+                    return value
+        return None
+
+    def _stack_touch_values(self, values, device, dtype):
+        if torch.is_tensor(values[0]):
+            return torch.stack([v.to(device=device, dtype=dtype) for v in values], dim=0)
+        return torch.as_tensor(np.array(values), device=device, dtype=dtype)
+
+    def _extract_touch_inputs(self, examples: List[dict], device, dtype=torch.float32):
+        touch_cfg = self.config.framework.action_model.get("touch", {})
+        if not touch_cfg.get("enabled", False) and not touch_cfg.get("checkpoint_encoder", None):
+            return None
+
+        contact_key = touch_cfg.get("joint_contact_key", "joint_contact")
+        angle_key = touch_cfg.get("finger_angles_key", "finger_angles")
+        contacts = [self._read_touch_key(example, contact_key) for example in examples]
+        angles = [self._read_touch_key(example, angle_key) for example in examples] if angle_key else [None] * len(examples)
+
+        missing_contact = any(v is None for v in contacts)
+        missing_angles = any(v is None for v in angles)
+        derive_angles = touch_cfg.get("derive_finger_angles_from_state", True)
+
+        if missing_contact or (missing_angles and not derive_angles):
+            if touch_cfg.get("require_touch", False):
+                sample_keys = sorted(examples[0].keys())
+                touch_keys = sorted(examples[0].get("touch", {}).keys()) if isinstance(examples[0].get("touch"), dict) else []
+                tactile_keys = (
+                    sorted(examples[0].get("tactile", {}).keys()) if isinstance(examples[0].get("tactile"), dict) else []
+                )
+                need = f"`{contact_key}`"
+                if not derive_angles:
+                    need += f" and `{angle_key}`"
+                raise KeyError(
+                    "QwenGR00T_touch requires touch inputs, but batch sample is missing them. "
+                    f"Need {need} at sample root, sample['touch'], or sample['tactile']. "
+                    f"Sample keys={sample_keys}, touch keys={touch_keys}, tactile keys={tactile_keys}."
+                )
+            return None
+
+        touch = {"joint_contact": self._stack_touch_values(contacts, device=device, dtype=dtype)}
+        if not missing_angles:
+            touch["finger_angles"] = self._stack_touch_values(angles, device=device, dtype=dtype)
+        return touch
+
+    def _repeat_touch_inputs(self, touch, repeats: int):
+        if touch is None:
+            return None
+        return {
+            key: value.repeat((repeats,) + (1,) * (value.dim() - 1))
+            for key, value in touch.items()
+        }
 
     def forward(
         self,
@@ -191,6 +300,7 @@ class Qwen_GR00T(baseframework):
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            touch = self._extract_touch_inputs(examples, device=last_hidden.device)
             actions = torch.tensor(
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
             )  # [B, T_full, action_dim]
@@ -203,6 +313,7 @@ class Qwen_GR00T(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+            touch_repeated = self._repeat_touch_inputs(touch, repeated_diffusion_steps)
             if backbone_attention_mask is not None:
                 backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
                     dtype=torch.bool
@@ -216,6 +327,7 @@ class Qwen_GR00T(baseframework):
             action_loss = self.action_model(
                 last_hidden_repeated, actions_target_repeated, state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
+                touch=touch_repeated,
             )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss}
@@ -270,8 +382,9 @@ class Qwen_GR00T(baseframework):
 
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
+            touch = self._extract_touch_inputs(examples, device=last_hidden.device)
             pred_actions = self.action_model.predict_action(
-                last_hidden, state, encoder_attention_mask=backbone_attention_mask
+                last_hidden, state, encoder_attention_mask=backbone_attention_mask, touch=touch
             )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
@@ -302,7 +415,7 @@ if __name__ == "__main__":
 
     cfg = OmegaConf.load(args.config_yaml)
 
-    model: Qwen_GR00T = Qwen_GR00T(cfg)
+    model: Qwen_GR00T_touch = Qwen_GR00T_touch(cfg)
     print(model)
 
     image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))

@@ -10,12 +10,6 @@ from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (
 from starVLA.training.trainer_utils import initialize_overwatch
 from transformers import AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
-import transformers.utils.import_utils as _tf_import_utils
-
-# causal-conv1d wheels are ABI-sensitive. If an incompatible binary is installed,
-# Qwen3.5 import fails before Transformers can fall back to the torch path.
-_tf_import_utils.is_causal_conv1d_available.cache_clear()
-_tf_import_utils.is_causal_conv1d_available = lambda: False
 
 try:
     from transformers import Qwen3_5ForConditionalGeneration
@@ -86,6 +80,14 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         # alin qwen3.5 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
+        self.num_learnable_prompt_tokens = int(qwenvl_config.get("num_learnable_prompt_tokens", 0))
+        if self.num_learnable_prompt_tokens > 0:
+            hidden_size = int(self.model.config.hidden_size)
+            self.learnable_prompt_tokens = nn.Parameter(
+                torch.randn(self.num_learnable_prompt_tokens, hidden_size) * 0.02
+            )
+        else:
+            self.learnable_prompt_tokens = None
 
         # only for fast base model
         if "-Action" in model_id:
@@ -106,6 +108,53 @@ class _QWen3_5_VL_Interface(nn.Module):
             )
 
         return outputs
+
+    def _prepend_learnable_prompt(self, batch_inputs):
+        if self.learnable_prompt_tokens is None:
+            return batch_inputs
+
+        input_ids = batch_inputs.get("input_ids", None)
+        if input_ids is None:
+            return batch_inputs
+
+        token_embeds = self.model.get_input_embeddings()(input_ids)
+        batch_size = token_embeds.shape[0]
+        prompt_embeds = self.learnable_prompt_tokens.to(
+            device=token_embeds.device,
+            dtype=token_embeds.dtype,
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+
+        batch_inputs["inputs_embeds"] = torch.cat([prompt_embeds, token_embeds], dim=1)
+        del batch_inputs["input_ids"]
+
+        if "attention_mask" in batch_inputs and batch_inputs["attention_mask"] is not None:
+            prompt_mask = torch.ones(
+                batch_size,
+                self.num_learnable_prompt_tokens,
+                device=batch_inputs["attention_mask"].device,
+                dtype=batch_inputs["attention_mask"].dtype,
+            )
+            batch_inputs["attention_mask"] = torch.cat([prompt_mask, batch_inputs["attention_mask"]], dim=1)
+
+        if "labels" in batch_inputs and batch_inputs["labels"] is not None:
+            prompt_labels = torch.full(
+                (batch_size, self.num_learnable_prompt_tokens),
+                IGNORE_INDEX,
+                device=batch_inputs["labels"].device,
+                dtype=batch_inputs["labels"].dtype,
+            )
+            batch_inputs["labels"] = torch.cat([prompt_labels, batch_inputs["labels"]], dim=1)
+
+        if "mm_token_type_ids" in batch_inputs and batch_inputs["mm_token_type_ids"] is not None:
+            prompt_mm_ids = torch.zeros(
+                batch_size,
+                self.num_learnable_prompt_tokens,
+                device=batch_inputs["mm_token_type_ids"].device,
+                dtype=batch_inputs["mm_token_type_ids"].dtype,
+            )
+            batch_inputs["mm_token_type_ids"] = torch.cat([prompt_mm_ids, batch_inputs["mm_token_type_ids"]], dim=1)
+
+        return batch_inputs
 
     def generate(
         self,
@@ -142,6 +191,7 @@ class _QWen3_5_VL_Interface(nn.Module):
                 prompt = CoT_prompt.replace("{instruction}", instruction)
             else:
                 prompt = instruction
+
 
             content.append({"type": "text", "text": prompt})
             msg = [{"role": "user", "content": content}]
@@ -183,7 +233,9 @@ class _QWen3_5_VL_Interface(nn.Module):
             labels[labels == self.processor.tokenizer.pad_token_id] = -100  ## mask out pad tokens as well
             batch_inputs["labels"] = labels
 
-        return batch_inputs.to(self.model.device)
+        batch_inputs = batch_inputs.to(self.model.device)
+        batch_inputs = self._prepend_learnable_prompt(batch_inputs)
+        return batch_inputs
 
 
 if __name__ == "__main__":

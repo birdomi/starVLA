@@ -23,6 +23,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # NPU support: import torch_npu and enable automatic CUDA→NPU mapping.
 # On GPU-only environments this is a no-op (ImportError is silently ignored).
 try:

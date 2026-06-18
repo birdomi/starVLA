@@ -98,6 +98,17 @@ class LeRobotActionMetadata(LeRobotStateActionMetadata):
     )
 
 
+class LeRobotTactileMetadata(LeRobotModalityField):
+    """Metadata for tactile force arrays."""
+
+    start: int = Field(default=0, description="The start index in the tactile vector")
+    end: int = Field(..., description="The end index in the tactile vector")
+    source_shape: Optional[tuple[int, ...]] = Field(
+        default=None, description="Original tactile sensor shape"
+    )
+    dtype: str = Field(default="float64", description="The data type of the modality")
+
+
 class LeRobotModalityMetadata(BaseModel):
     """Metadata for a LeRobot modality."""
 
@@ -116,6 +127,10 @@ class LeRobotModalityMetadata(BaseModel):
     annotation: Optional[dict[str, LeRobotModalityField]] = Field(
         default=None,
         description="The metadata for the annotation modality. The keys are the new names of each annotation modality.",
+    )
+    tactile: Optional[dict[str, LeRobotTactileMetadata]] = Field(
+        default=None,
+        description="The metadata for the tactile modality.",
     )
 
     def get_key_meta(self, key: str) -> LeRobotModalityField:
@@ -163,6 +178,15 @@ class LeRobotModalityMetadata(BaseModel):
                     f"Key: {key}, annotation key {subkey} not found in metadata, available annotation keys: {self.annotation.keys()}"
                 )
             return self.annotation[subkey]
+        elif modality == "tactile":
+            assert (
+                self.tactile is not None
+            ), "Trying to get tactile metadata for a dataset with no tactile data"
+            if subkey not in self.tactile:
+                raise ValueError(
+                    f"Key: {key}, tactile key {subkey} not found in metadata, available tactile keys: {self.tactile.keys()}"
+                )
+            return self.tactile[subkey]
         else:
             raise ValueError(f"Key: {key}, unexpected modality: {modality}")
 
