@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import importlib
+from pathlib import Path
 import sys
 import types
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -36,46 +35,532 @@ def _resolve_path(path: str | None) -> Path | None:
     return out
 
 
-def _ensure_lightning_rank_zero_stub() -> None:
-    try:
-        importlib.import_module("lightning.fabric.utilities")
-        return
-    except ModuleNotFoundError:
-        pass
+def _install_tactile_ssl_checkpoint_stubs() -> None:
+    """Allow loading tactile_ssl checkpoints while only using their tensor state."""
+    module_name = "tactile_ssl.model.custom_scheduler"
+    tactile_ssl = sys.modules.setdefault("tactile_ssl", types.ModuleType("tactile_ssl"))
+    tactile_model = sys.modules.setdefault("tactile_ssl.model", types.ModuleType("tactile_ssl.model"))
+    custom_scheduler = sys.modules.setdefault(module_name, types.ModuleType(module_name))
 
-    lightning = sys.modules.setdefault("lightning", types.ModuleType("lightning"))
-    fabric = sys.modules.setdefault("lightning.fabric", types.ModuleType("lightning.fabric"))
-    utilities = types.ModuleType("lightning.fabric.utilities")
+    for class_name in ("WarmupCosineScheduler", "CosineWDSchedule"):
+        if not hasattr(custom_scheduler, class_name):
+            setattr(custom_scheduler, class_name, type(class_name, (), {"__module__": module_name}))
 
-    def rank_zero_only(fn=None, *args, **kwargs):
-        if fn is None:
-            return lambda wrapped: wrapped
-        return fn
-
-    utilities.rank_zero_only = rank_zero_only
-    lightning.fabric = fabric
-    fabric.utilities = utilities
-    sys.modules["lightning.fabric.utilities"] = utilities
+    setattr(tactile_ssl, "model", tactile_model)
+    setattr(tactile_model, "custom_scheduler", custom_scheduler)
 
 
-def _import_angle_factory(touch_cfg: Any):
-    repo_path = _resolve_path(_cfg_get(touch_cfg, "repo_path", "../touch-rep"))
-    if repo_path and repo_path.is_dir() and str(repo_path) not in sys.path:
-        sys.path.insert(0, str(repo_path))
+def _load_checkpoint_state_dict(checkpoint_path: Path) -> dict[str, torch.Tensor]:
+    _install_tactile_ssl_checkpoint_stubs()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("model") or checkpoint.get("state_dict") or checkpoint
+    else:
+        state_dict = checkpoint
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Expected checkpoint state_dict to be a dict, got {type(state_dict).__name__}.")
+    return state_dict
 
-    _ensure_lightning_rank_zero_stub()
-    module = importlib.import_module("tactile_ssl.model.angle_transformer")
+
+def _strip_encoder_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    prefixes = (
+        "model_encoder.",
+        "teacher_encoder.backbone.",
+        "student_encoder.backbone.",
+        "encoder.",
+    )
+    for prefix in prefixes:
+        stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        if stripped:
+            return stripped
+    return state_dict
+
+
+def _infer_angle_transformer_kwargs(raw: dict[str, torch.Tensor]) -> dict[str, Any]:
+    inferred: dict[str, Any] = {}
+    if "contact_pos_embed" in raw:
+        inferred["in_dim"] = int(raw["contact_pos_embed"].shape[1] * 2)
+        inferred["embed_dim"] = int(raw["contact_pos_embed"].shape[-1])
+    if "angle_pos_embed" in raw:
+        inferred["pos_in_dim"] = int(raw["angle_pos_embed"].shape[1] * 2)
+    if "sensor_embed.proj.weight" in raw:
+        inferred["in_chans"] = int(raw["sensor_embed.proj.weight"].shape[1])
+        inferred.setdefault("embed_dim", int(raw["sensor_embed.proj.weight"].shape[0]))
+        inferred["time_chunk_size"] = int(raw["sensor_embed.proj.weight"].shape[-1])
+    if "angle_embed.proj.weight" in raw:
+        inferred["pos_in_chans"] = int(raw["angle_embed.proj.weight"].shape[1])
+    if "register_tokens" in raw:
+        inferred["num_register_tokens"] = int(raw["register_tokens"].shape[1])
+    if "mask_token" in raw:
+        inferred["with_masktoken"] = True
+    block_indices = {
+        int(k.split(".", 2)[1])
+        for k in raw
+        if k.startswith("blocks.") and len(k.split(".", 2)) > 2 and k.split(".", 2)[1].isdigit()
+    }
+    if block_indices:
+        inferred["depth"] = max(block_indices) + 1
+    sensor_block_indices = {
+        int(k.split(".", 2)[1])
+        for k in raw
+        if k.startswith("sensor_block.") and len(k.split(".", 2)) > 2 and k.split(".", 2)[1].isdigit()
+    }
+    if sensor_block_indices:
+        inferred["pre_fusion_depth"] = max(sensor_block_indices) + 1
+    if "pos_embed" in raw and "in_dim" in inferred:
+        num_chunks = int(raw["pos_embed"].shape[1] // inferred["in_dim"])
+        inferred["sequence_length"] = num_chunks * int(inferred.get("time_chunk_size", 1))
+    return inferred
+
+
+class LocalPatchEmbed1d(nn.Module):
+    def __init__(self, modal_chans: int, modal_lens: int, chunk_size: int, embed_dim: int, padding: int = 0):
+        super().__init__()
+        self.modal_chans = int(modal_chans)
+        self.modal_lens = int(modal_lens)
+        self.num_chunks = int(modal_lens // chunk_size)
+        self.chunk_size = int(chunk_size)
+        self.embed_dim = int(embed_dim)
+        self.proj = nn.Conv1d(
+            in_channels=self.modal_chans,
+            out_channels=self.embed_dim,
+            kernel_size=self.chunk_size,
+            stride=self.chunk_size,
+            padding=int(padding),
+        )
+        self.layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x = x.transpose(1, 2)
+        x = self.layer_norm(x)
+        return x.transpose(1, 2)
+
+
+class LocalMlp(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int, act_layer=nn.GELU, drop: float = 0.0, bias: bool = True):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, in_features, bias=bias)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return self.drop(x)
+
+
+class LocalAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.num_heads = int(num_heads)
+        head_dim = dim // self.num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor, attn_bias=None, return_attn: bool = False):
+        batch_size, tokens, channels = x.shape
+        qkv = self.qkv(x).reshape(batch_size, tokens, 3, self.num_heads, channels // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+        attn = q @ k.transpose(-2, -1)
+        if attn_bias is not None:
+            attn = attn + attn_bias
+        attn = self.attn_drop(attn.softmax(dim=-1))
+        x = (attn @ v).transpose(1, 2).reshape(batch_size, tokens, channels)
+        x = self.proj_drop(self.proj(x))
+        return attn if return_attn else x
+
+
+class LocalTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        act_layer=nn.GELU,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.attn = LocalAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.ls1 = nn.Identity()
+        self.drop_path1 = nn.Identity()
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.mlp = LocalMlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=drop,
+            bias=ffn_bias,
+        )
+        self.ls2 = nn.Identity()
+        self.drop_path2 = nn.Identity()
+
+    def forward(self, x: torch.Tensor, attn_bias=None, return_attn: bool = False) -> torch.Tensor:
+        if return_attn:
+            return self.attn(self.norm1(x), attn_bias=attn_bias, return_attn=True)
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+FULL_SKELETON_SIZE = 42
+TACTILE_SENSOR_IDXS = [4, 8, 12, 16, 20, 25, 29, 33, 37, 41]
+
+
+class LocalAngleTransformer(nn.Module):
+    """Self-contained AngleTransformer compatible with touch-rep checkpoint keys."""
+
+    def __init__(
+        self,
+        in_dim: int = 42,
+        in_chans: int = 1,
+        pos_in_dim: int = 10,
+        pos_in_chans: int = 4,
+        sequence_length: int = 1,
+        time_chunk_size: int = 1,
+        num_register_tokens: int = 1,
+        embed_dim: int = 192,
+        depth: int = 8,
+        num_heads: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        with_masktoken: bool = True,
+        use_null_token: bool = True,
+        pre_fusion_depth: int | None = None,
+        normalization: Any = None,
+        fine_tune_sensor: bool = False,
+        fine_tune_sensor_shallow_blocks: int | None = 0,
+        **_: Any,
+    ):
+        super().__init__()
+        if sequence_length % time_chunk_size != 0:
+            raise ValueError(
+                f"sequence_length({sequence_length}) must be divisible by time_chunk_size({time_chunk_size})."
+            )
+        if in_dim % 2 != 0:
+            raise ValueError(f"in_dim({in_dim}) must be even.")
+        if pos_in_dim % 2 != 0:
+            raise ValueError(f"pos_in_dim({pos_in_dim}) must be even.")
+
+        self.in_dim = int(in_dim)
+        self.in_chans = int(in_chans)
+        self.pos_in_dim = int(pos_in_dim)
+        self.pos_in_chans = int(pos_in_chans)
+        self.embed_dim = int(embed_dim)
+        self.sequence_length = int(sequence_length)
+        self.time_chunk_size = int(time_chunk_size)
+        self.depth = int(depth)
+        self.num_heads = int(num_heads)
+        self.num_register_tokens = int(num_register_tokens)
+        self.use_null_token = bool(use_null_token)
+        self.pre_fusion_depth = int(pre_fusion_depth if pre_fusion_depth is not None else self.depth // 4)
+        self.fine_tune_sensor_shallow_blocks = (
+            self.pre_fusion_depth if fine_tune_sensor_shallow_blocks is None else int(fine_tune_sensor_shallow_blocks)
+        )
+
+        self.register_tokens = (
+            nn.Parameter(torch.zeros(1, self.num_register_tokens, self.embed_dim))
+            if self.num_register_tokens > 0
+            else None
+        )
+        num_chunks = self.sequence_length // self.time_chunk_size
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_chunks * self.in_dim, self.embed_dim))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim)) if with_masktoken else None
+
+        self.blocks = nn.ModuleList(
+            [
+                LocalTransformerBlock(
+                    dim=self.embed_dim,
+                    num_heads=self.num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    drop=dropout,
+                )
+                for _ in range(self.depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
+
+        self.contact_pos_embed = nn.Parameter(torch.zeros(2, self.in_dim // 2, self.embed_dim))
+        self.angle_pos_embed = nn.Parameter(torch.zeros(2, self.pos_in_dim // 2, self.embed_dim))
+        self.hand_embed = nn.Parameter(torch.zeros(2, self.embed_dim))
+        self.sensor_embed = LocalPatchEmbed1d(self.in_chans, self.sequence_length, self.time_chunk_size, self.embed_dim)
+        self.angle_embed = LocalPatchEmbed1d(
+            self.pos_in_chans,
+            self.sequence_length,
+            self.time_chunk_size,
+            self.embed_dim,
+        )
+        self.sensor_block = nn.ModuleList(
+            [
+                LocalTransformerBlock(
+                    dim=self.embed_dim,
+                    num_heads=self.num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    drop=0.0,
+                )
+                for _ in range(self.pre_fusion_depth)
+            ]
+        )
+
+        if normalization is not None:
+            mean = torch.tensor(_cfg_get(normalization, "mean", [0.0]), dtype=torch.float32)
+            std = torch.tensor(_cfg_get(normalization, "std", [1.0]), dtype=torch.float32)
+        else:
+            mean = torch.zeros(self.in_chans, dtype=torch.float32)
+            std = torch.ones(self.in_chans, dtype=torch.float32)
+        self.register_buffer("signal_mean", mean)
+        self.register_buffer("signal_std", std)
+
+        self.init_weights()
+        self.fine_tune_sensor = bool(fine_tune_sensor)
+        if self.fine_tune_sensor:
+            self._apply_fine_tune_sensor()
+
+    def init_weights(self) -> None:
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        if self.register_tokens is not None:
+            nn.init.trunc_normal_(self.register_tokens, std=1e-6)
+        if self.mask_token is not None:
+            nn.init.trunc_normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.hand_embed, std=0.02)
+        nn.init.trunc_normal_(self.contact_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.angle_pos_embed, std=0.02)
+
+    def _apply_fine_tune_sensor(self) -> None:
+        shallow_blocks = min(self.fine_tune_sensor_shallow_blocks, len(self.blocks))
+        for name, param in self.named_parameters():
+            top = name.split(".", 1)[0]
+            is_shallow_block = False
+            if top == "blocks":
+                parts = name.split(".", 2)
+                is_shallow_block = len(parts) > 1 and parts[1].isdigit() and int(parts[1]) < shallow_blocks
+            param.requires_grad = top in {"sensor_embed", "sensor_block"} or name == "contact_pos_embed" or is_shallow_block
+
+    def _full_embed(self, per_hand: torch.Tensor) -> torch.Tensor:
+        hand_embed = self.hand_embed.float()
+        left = per_hand[0].float() + hand_embed[0]
+        right = per_hand[1].float() + hand_embed[1]
+        return torch.cat([left, right], dim=0)
+
+    def _adapt_contact_channels(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] == self.in_chans:
+            return x
+        if self.in_chans == 1:
+            return torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+        if x.shape[-1] == 1:
+            return x.expand(*x.shape[:-1], self.in_chans)
+        raise ValueError(f"Contact channel dim {x.shape[-1]} does not match encoder in_chans {self.in_chans}.")
+
+    def expand_to_skeleton(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size, steps, sensors, chans = x.shape
+        if sensors == self.in_dim:
+            return x, None
+        if self.in_dim == FULL_SKELETON_SIZE and sensors == len(TACTILE_SENSOR_IDXS):
+            x_full = torch.zeros(batch_size, steps, self.in_dim, chans, device=x.device, dtype=x.dtype)
+            x_full[:, :, TACTILE_SENSOR_IDXS, :] = x
+            null_mask = torch.ones(batch_size, self.in_dim, dtype=torch.bool, device=x.device)
+            null_mask[:, TACTILE_SENSOR_IDXS] = False
+            return x_full, null_mask.unsqueeze(0)
+        raise ValueError(f"Cannot map {sensors} contact sensors to encoder in_dim {self.in_dim}.")
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        mean = self.signal_mean.to(device=x.device, dtype=x.dtype)
+        std = self.signal_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
+        return (x - mean) / std
+
+    def _apply_embed1d(self, x: torch.Tensor, embed: LocalPatchEmbed1d) -> torch.Tensor:
+        batch_size, _, sensors, _ = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(batch_size * sensors, x.shape[-1], x.shape[1])
+        x = embed(x)
+        return x.permute(0, 2, 1).reshape(batch_size, sensors, x.shape[-1], self.embed_dim).transpose(1, 2)
+
+    def pre_sensor_embed(self, x: torch.Tensor) -> torch.Tensor:
+        return self._apply_embed1d(self.normalize(x), self.sensor_embed)
+
+    def pre_pos_embed(self, pos: torch.Tensor) -> torch.Tensor:
+        return self._apply_embed1d(pos, self.angle_embed)
+
+    @staticmethod
+    def _repeat_joint_embed(joint_embed: torch.Tensor, token_count: int) -> torch.Tensor:
+        if token_count == joint_embed.shape[0]:
+            return joint_embed
+        if token_count % joint_embed.shape[0] != 0:
+            raise ValueError(f"Cannot repeat joint embedding of length {joint_embed.shape[0]} to {token_count}.")
+        return joint_embed.repeat(token_count // joint_embed.shape[0], 1)
+
+    def prepare_tokens_with_mask(
+        self,
+        x: torch.Tensor,
+        masktoken_masks: torch.Tensor | None,
+        joint_embed: torch.Tensor,
+        skip_register: bool,
+    ) -> torch.Tensor:
+        token_count = x.shape[1] * x.shape[2]
+        x = x + self._repeat_joint_embed(joint_embed, token_count).view(1, x.shape[1], x.shape[2], -1)
+        if masktoken_masks is not None:
+            if self.mask_token is None:
+                raise RuntimeError("masktoken_masks provided, but encoder has no mask_token.")
+            mask = masktoken_masks.flatten(0, 1)
+            mask = mask[:, None, :, None].expand(-1, x.shape[1], -1, x.shape[-1])
+            x = torch.where(mask, self.mask_token.to(dtype=x.dtype), x)
+        x = x.reshape(x.shape[0], token_count, x.shape[-1])
+        if self.register_tokens is not None and not skip_register:
+            x = torch.cat([self.register_tokens.to(dtype=x.dtype).expand(x.shape[0], -1, -1), x], dim=1)
+        return x
+
+    def sensor_transform(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.sensor_block:
+            x = block(x, None)
+        return x
+
+    def transform_concat(self, sen: torch.Tensor, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sen_pe = self._repeat_joint_embed(self._full_embed(self.contact_pos_embed), sen.shape[1]).to(
+            device=sen.device,
+            dtype=sen.dtype,
+        )
+        angle_tokens = pos.shape[1] - self.num_register_tokens
+        ang_pe = self._repeat_joint_embed(self._full_embed(self.angle_pos_embed), angle_tokens).to(
+            device=pos.device,
+            dtype=pos.dtype,
+        )
+        sen = sen + sen_pe
+        if angle_tokens > 0:
+            pos[:, self.num_register_tokens:] = pos[:, self.num_register_tokens:] + ang_pe
+        fused = torch.cat([pos, sen], dim=1)
+        for block in self.blocks:
+            fused = block(fused, None)
+        fused = self.norm(fused)
+        return fused, fused
+
+    def _align_angles(self, finger_angles: torch.Tensor, target_steps: int) -> torch.Tensor:
+        if finger_angles.shape[1] == 1 and target_steps != 1:
+            finger_angles = finger_angles.expand(-1, target_steps, -1, -1)
+        if finger_angles.shape[2] < self.pos_in_dim:
+            pad = finger_angles[:, :, -1:, :].expand(-1, -1, self.pos_in_dim - finger_angles.shape[2], -1)
+            finger_angles = torch.cat((finger_angles, pad), dim=2)
+        elif finger_angles.shape[2] > self.pos_in_dim:
+            finger_angles = finger_angles[:, :, : self.pos_in_dim, :]
+        if finger_angles.shape[-1] != self.pos_in_chans:
+            raise ValueError(
+                f"Finger angle channel dim {finger_angles.shape[-1]} does not match encoder pos_in_chans {self.pos_in_chans}."
+            )
+        return finger_angles
+
+    def forward_features(self, joint_contact: torch.Tensor, finger_angles: torch.Tensor) -> dict[str, torch.Tensor]:
+        if joint_contact.dim() != 4:
+            raise ValueError(f"Expected joint_contact [B, T, N, C], got {joint_contact.shape}.")
+        if finger_angles.dim() != 4:
+            raise ValueError(f"Expected finger_angles [B, T, N, C], got {finger_angles.shape}.")
+
+        joint_contact = self._adapt_contact_channels(joint_contact)
+        masktoken_masks = None
+        if self.use_null_token:
+            joint_contact, masktoken_masks = self.expand_to_skeleton(joint_contact)
+        elif joint_contact.shape[2] != self.in_dim:
+            raise ValueError(f"Expected {self.in_dim} contact sensors, got {joint_contact.shape[2]}.")
+
+        finger_angles = self._align_angles(finger_angles, target_steps=joint_contact.shape[1])
+        sensor_tokens = self.pre_sensor_embed(joint_contact)
+        angle_tokens = self.pre_pos_embed(finger_angles)
+
+        sensor_embed = self._full_embed(self.contact_pos_embed).to(device=sensor_tokens.device, dtype=sensor_tokens.dtype)
+        angle_embed = self._full_embed(self.angle_pos_embed).to(device=angle_tokens.device, dtype=angle_tokens.dtype)
+        sensor_tokens = self.prepare_tokens_with_mask(
+            sensor_tokens,
+            masktoken_masks=masktoken_masks,
+            joint_embed=sensor_embed,
+            skip_register=True,
+        )
+        angle_tokens = self.prepare_tokens_with_mask(
+            angle_tokens,
+            masktoken_masks=None,
+            joint_embed=angle_embed,
+            skip_register=False,
+        )
+        sensor_tokens = self.sensor_transform(sensor_tokens)
+        x_prenorm, x_tokens = self.transform_concat(sensor_tokens, angle_tokens)
+        reg = self.num_register_tokens
+        return {
+            "x_norm_regtokens": x_tokens[:, :reg],
+            "x_norm_patchtokens": x_tokens[:, reg:],
+            "x_prenorm": x_prenorm[:, reg:],
+            "x_tokens": x_tokens,
+            "patch_tokens": x_tokens[:, reg:],
+            "register_tokens": x_tokens[:, :reg],
+        }
+
+    def forward(self, joint_contact: torch.Tensor, finger_angles: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(joint_contact, finger_angles)["x_norm_patchtokens"]
+
+
+def _angle_factory(touch_cfg: Any):
     model_size = _cfg_get(touch_cfg, "model_size", "tiny")
-    factory_name = {"tiny": "angle_tiny", "small": "angle_small"}.get(model_size, model_size)
-    return getattr(module, factory_name)
+    presets = {
+        "tiny": {"embed_dim": 192, "depth": 8, "num_heads": 3},
+        "small": {"embed_dim": 384, "depth": 12, "num_heads": 6},
+    }
+    preset = presets.get(model_size, {})
+
+    def factory(**kwargs):
+        kwargs = {**preset, **kwargs}
+        kwargs["embed_dim"] = int(_cfg_get(touch_cfg, "embed_dim", kwargs.get("embed_dim", 192)))
+        kwargs["depth"] = int(_cfg_get(touch_cfg, "depth", kwargs.get("depth", 4)))
+        kwargs["num_heads"] = int(_cfg_get(touch_cfg, "num_heads", kwargs.get("num_heads", 3)))
+        return LocalAngleTransformer(**kwargs)
+
+    return factory
 
 
 class TouchAngleEncoder(nn.Module):
-    """AngleTransformer wrapper. Returns tokens aligned to VLM hidden dim."""
+    """Local touch encoder wrapper. Returns tokens aligned to VLM hidden dim."""
 
     def __init__(self, touch_cfg: Any, target_dim: int):
         super().__init__()
-        factory = _import_angle_factory(touch_cfg)
+        factory = _angle_factory(touch_cfg)
+        checkpoint = _resolve_path(_cfg_get(touch_cfg, "checkpoint_encoder", None))
+        checkpoint_raw = None
+        inferred_kwargs = {}
+        if checkpoint is not None:
+            checkpoint_raw = _strip_encoder_state_dict(_load_checkpoint_state_dict(checkpoint))
+            inferred_kwargs = _infer_angle_transformer_kwargs(checkpoint_raw)
+            if inferred_kwargs.get("in_dim") == FULL_SKELETON_SIZE:
+                inferred_kwargs["use_null_token"] = True
 
         kwargs = {
             "in_dim": _cfg_get(touch_cfg, "in_dim", 10),
@@ -91,6 +576,7 @@ class TouchAngleEncoder(nn.Module):
             "fine_tune_sensor": _cfg_get(touch_cfg, "fine_tune_sensor", False),
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        kwargs.update(inferred_kwargs)
         self.encoder = factory(**kwargs)
         self.token_source = _cfg_get(touch_cfg, "token_source", "x_tokens")
         self.train_encoder = bool(_cfg_get(touch_cfg, "train_encoder", True))
@@ -115,37 +601,22 @@ class TouchAngleEncoder(nn.Module):
         embed_dim = int(getattr(self.encoder, "embed_dim"))
         self.projector = nn.Identity() if embed_dim == target_dim else nn.Linear(embed_dim, target_dim)
 
-        checkpoint = _resolve_path(_cfg_get(touch_cfg, "checkpoint_encoder", None))
         if checkpoint is not None:
-            self.load_encoder(checkpoint)
+            self.load_encoder(checkpoint, raw_state_dict=checkpoint_raw)
 
         if not self.train_encoder:
             self.encoder.requires_grad_(False)
             self.encoder.eval()
 
-    def load_encoder(self, checkpoint_path: Path) -> None:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("model") or checkpoint.get("state_dict") or checkpoint
-
-        prefixes = (
-            "model_encoder.",
-            "teacher_encoder.backbone.",
-            "student_encoder.backbone.",
-            "encoder.",
-        )
-        raw = None
-        for prefix in prefixes:
-            stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-            if stripped:
-                raw = stripped
-                break
+    def load_encoder(self, checkpoint_path: Path, raw_state_dict: dict[str, torch.Tensor] | None = None) -> None:
+        raw = raw_state_dict
         if raw is None:
-            raw = state_dict
+            raw = _strip_encoder_state_dict(_load_checkpoint_state_dict(checkpoint_path))
 
         model_state = self.encoder.state_dict()
         filtered = {k: v for k, v in raw.items() if k in model_state and v.shape == model_state[k].shape}
         self.encoder.load_state_dict(filtered, strict=False)
-        print(f"Loaded AngleTransformer encoder keys: {len(filtered)}/{len(raw)} from {checkpoint_path}")
+        print(f"Loaded local touch encoder keys: {len(filtered)}/{len(raw)} from {checkpoint_path}")
 
     def _encode_once(self, joint_contact: torch.Tensor, finger_angles: torch.Tensor) -> torch.Tensor:
         ctx = torch.enable_grad() if self.train_encoder else torch.no_grad()
@@ -224,7 +695,7 @@ class TouchAngleEncoder(nn.Module):
                 tokens = self._encode_once(flat_contact, flat_angles)
                 tokens = tokens.reshape(batch_size, steps * tokens.shape[1], tokens.shape[-1])
             else:
-                raise ValueError(f"Touch sequence length {steps} does not match AngleTransformer length {seq_len}.")
+                raise ValueError(f"Touch sequence length {steps} does not match local touch encoder length {seq_len}.")
         elif joint_contact.dim() == 5:
             batch_size, windows, steps, num_joints, chans = joint_contact.shape
             flat_contact = joint_contact.reshape(batch_size * windows, steps, num_joints, chans)
