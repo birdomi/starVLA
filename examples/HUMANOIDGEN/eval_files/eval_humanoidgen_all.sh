@@ -8,8 +8,8 @@ CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 BASE_OUTPUT_DIR="${OUTPUT_DIR:-}"
 BASE_RESULTS_FILE="${RESULTS_FILE:-}"
 # CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/humanoidgen_qwengroot/checkpoints/steps_80000_pytorch_model.pt}"
-# CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/humanoidgen_qwengroot_touch/checkpoints/steps_30000_pytorch_model.pt}"
-CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/humanoidgen_qwengroot/checkpoints/steps_100000_pytorch_model.pt}"
+CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/humanoidgen_qwengroot_touch/checkpoints/steps_30000_pytorch_model.pt}"
+# CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/humanoidgen_qwengroot/checkpoints/steps_100000_pytorch_model.pt}"
 
 
 if [[ "${CKPT}" = /* ]]; then
