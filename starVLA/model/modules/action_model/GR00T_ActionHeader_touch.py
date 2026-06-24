@@ -526,7 +526,7 @@ class LocalAngleTransformer(nn.Module):
         }
 
     def forward(self, joint_contact: torch.Tensor, finger_angles: torch.Tensor) -> torch.Tensor:
-        return self.forward_features(joint_contact, finger_angles)["x_norm_patchtokens"]
+        return self.forward_features(joint_contact, finger_angles)["x_tokens"]
 
 
 def _angle_factory(touch_cfg: Any):
