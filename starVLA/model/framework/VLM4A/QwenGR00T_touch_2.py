@@ -112,7 +112,7 @@ class Qwen_GR00T_touch_2(Qwen_GR00T_touch):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = qwenvl_outputs.hidden_states[-1]
+            last_hidden = qwenvl_outputs.hidden_states[-4]
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             state_tensor = None
@@ -184,7 +184,7 @@ class Qwen_GR00T_touch_2(Qwen_GR00T_touch):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = qwenvl_outputs.hidden_states[-1]
+            last_hidden = qwenvl_outputs.hidden_states[-4]
 
         state_tensor = (
             torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)

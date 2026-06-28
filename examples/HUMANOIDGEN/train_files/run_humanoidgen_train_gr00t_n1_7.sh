@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Train QwenGR00T_touch_2 on HUMANOIDGEN.
-# Touch encoder tokens are concatenated to VLM embeddings before the GR00T action head.
+# Train HUMANOIDGEN from GR00T N1.7-style pretrained action weights.
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 
@@ -14,31 +13,33 @@ export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export WANDB_MODE=${WANDB_MODE:-disabled}
 
-Framework_name=${Framework_name:-QwenGR00T_touch_2}
-freeze_module_list=${freeze_module_list:-}
-base_vlm=${base_vlm:-playground/Pretrained_models/Qwen3.5-2B}
+Framework_name=${Framework_name:-GR00T_N1_7}
+freeze_module_list=${freeze_module_list:-qwen_vl_interface}
+base_vlm=${base_vlm:-playground/Pretrained_models/nvidia/Cosmos-Reason2-2B}
+attn_implementation=${attn_implementation:-sdpa}
 config_yaml=${config_yaml:-./examples/HUMANOIDGEN/train_files/starvla_train_humanoidgen.yaml}
 data_root_dir=${data_root_dir:-${HUMANOIDGEN_DATA:-playground/Datasets/HUMANOIDGEN_DATA}}
 data_mix=${data_mix:-humanoidgen_all}
 run_root_dir=${run_root_dir:-./playground/Checkpoints}
-run_id=${run_id:-humanoidgen_qwengroot_touch_all_tokens_intermediateVLM}
-per_device_batch_size=${per_device_batch_size:-32}
+run_id=${run_id:-humanoidgen_gr00t_n1_7}
+per_device_batch_size=${per_device_batch_size:-16}
 video_backend=${video_backend:-pyav}
 max_train_steps=${max_train_steps:-150000}
 save_interval=${save_interval:-10000}
+
+action_model_type=${action_model_type:-DiT-L}
+hidden_size=${hidden_size:-1024}
 action_dim=${action_dim:-26}
 state_dim=${state_dim:-26}
 action_horizon=${action_horizon:-16}
+repeated_diffusion_steps=${repeated_diffusion_steps:-4}
 
-tactile_encoder_ckpt=${tactile_encoder_ckpt:-playground/Pretrained_models/tactile_encoder/epoch-0200-all.ckpt}
-touch_model_size=${touch_model_size:-tiny}
-train_touch_encoder=${train_touch_encoder:-true}
-touch_token_source=${touch_token_source:-x_tokens}
-derive_finger_angles_from_state=${derive_finger_angles_from_state:-true}
-joint_contact_key=${joint_contact_key:-joint_contact}
+gr00t_pretrained_path=${gr00t_pretrained_path:-playground/Pretrained_models/GR00T-N1.7}
+gr00t_load_prefixes=${gr00t_load_prefixes:-action_model}
 
-if [[ ! -f "${tactile_encoder_ckpt}" ]]; then
-  echo "[ERROR] tactile encoder checkpoint not found: ${tactile_encoder_ckpt}" >&2
+if [[ ! -e "${gr00t_pretrained_path}" ]]; then
+  echo "[ERROR] GR00T N1.7 checkpoint not found: ${gr00t_pretrained_path}" >&2
+  echo "        prepare it with examples/HUMANOIDGEN/train_files/prepare_gr00t_n1_7_pretrained.sh" >&2
   exit 1
 fi
 
@@ -60,23 +61,21 @@ fi
 
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --main_process_port "${MAIN_PROCESS_PORT:-29503}" \
+  --main_process_port "${MAIN_PROCESS_PORT:-29504}" \
   --num_processes "${num_processes}" \
   starVLA/training/train_starvla.py \
   --config_yaml "${config_yaml}" \
   --framework.name "${Framework_name}" \
   --framework.qwenvl.base_vlm "${base_vlm}" \
+  --framework.qwenvl.attn_implementation "${attn_implementation}" \
+  --framework.action_model.action_model_type "${action_model_type}" \
+  --framework.action_model.hidden_size "${hidden_size}" \
   --framework.action_model.action_dim "${action_dim}" \
   --framework.action_model.state_dim "${state_dim}" \
   --framework.action_model.action_horizon "${action_horizon}" \
-  --framework.action_model.touch.enabled true \
-  --framework.action_model.touch.checkpoint_encoder "${tactile_encoder_ckpt}" \
-  --framework.action_model.touch.model_size "${touch_model_size}" \
-  --framework.action_model.touch.train_encoder "${train_touch_encoder}" \
-  --framework.action_model.touch.token_source "${touch_token_source}" \
-  --framework.action_model.touch.require_touch true \
-  --framework.action_model.touch.derive_finger_angles_from_state "${derive_finger_angles_from_state}" \
-  --framework.action_model.touch.joint_contact_key "${joint_contact_key}" \
+  --framework.action_model.repeated_diffusion_steps "${repeated_diffusion_steps}" \
+  --framework.gr00t_n1_7.checkpoint_path "${gr00t_pretrained_path}" \
+  --framework.gr00t_n1_7.load_prefixes "${gr00t_load_prefixes}" \
   --datasets.vla_data.data_root_dir "${data_root_dir}" \
   --datasets.vla_data.data_mix "${data_mix}" \
   --datasets.vla_data.per_device_batch_size "${per_device_batch_size}" \
