@@ -1400,7 +1400,7 @@ class LeRobotSingleDataset(Dataset):
         action = []
         for action_key in self.modality_keys["action"]:
             action.append(data[action_key])
-        action = np.concatenate(action, axis=1).astype(np.float16)
+        action = np.concatenate(action, axis=1).astype(np.float32)
 
         sample = {
             "action": action,
@@ -1422,7 +1422,7 @@ class LeRobotSingleDataset(Dataset):
                     stacklevel=2,
                 )
             else:
-                state = np.concatenate(state, axis=1).astype(np.float16)
+                state = np.concatenate(state, axis=1).astype(np.float32)
                 sample["state"] = state
 
         tactile_keys = self.modality_keys.get("tactile", [])

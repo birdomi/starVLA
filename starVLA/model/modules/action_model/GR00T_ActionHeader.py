@@ -359,7 +359,7 @@ class FlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
+        loss = ((pred_actions.float() - velocity.float()) ** 2).mean()
         return loss
 
     @torch.no_grad()

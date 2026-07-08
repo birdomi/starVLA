@@ -217,6 +217,7 @@ class Qwen_GR00T(baseframework):
                 last_hidden_repeated, actions_target_repeated, state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
             )  # (B, chunk_len, action_dim)
+            action_loss = torch.where(action_loss <= 1.0, torch.sqrt(action_loss + 1e-6), action_loss)
 
         return {"action_loss": action_loss}
 

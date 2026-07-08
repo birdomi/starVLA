@@ -10,16 +10,34 @@ prefix before matching.
 """
 
 import json
+import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from starVLA.model.framework.VLM4A.CosmosGR00T import Cosmos_GR00T
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.training.trainer_utils import initialize_overwatch
+from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 logger = initialize_overwatch(__name__)
+
+
+def _rank0_print(message):
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(message, flush=True)
+
+
+def _print_sample(title, rows, limit):
+    if not rows:
+        return
+    shown = rows if limit < 0 else rows[:limit]
+    _rank0_print(f"[GR00T_N1_7] {title}: showing {len(shown)}/{len(rows)}")
+    for row in shown:
+        _rank0_print(f"  {row}")
 
 
 def _cfg_get(cfg, key, default=None):
@@ -61,6 +79,7 @@ def _normalize_key(key):
     remaps = (
         ("action_head.", "action_model."),
         ("action_head_diffusion_model.", "action_model.model."),
+        ("backbone.model.", "qwen_vl_interface.model."),
     )
     for old, new in remaps:
         if key.startswith(old):
@@ -125,7 +144,7 @@ def _load_state_file(path):
 @FRAMEWORK_REGISTRY.register("GR00T_N1_7")
 class GR00T_N1_7(Cosmos_GR00T):
     """
-    Cosmos-Reason2/Qwen3-VL GR00T with GR00T N1.7 partial init.
+    Cosmos GR00T with GR00T N1.7 partial init.
 
     Config keys:
       framework.gr00t_n1_7.checkpoint_path
@@ -134,7 +153,100 @@ class GR00T_N1_7(Cosmos_GR00T):
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         super().__init__(config=config, **kwargs)
+        load_cfg = _cfg_get(self.config.framework, "gr00t_n1_7", None)
+        self.vlm_hidden_state_index = int(_cfg_get(load_cfg, "vlm_hidden_state_index", 16))
         self._load_gr00t_n1_7_pretrained()
+
+    def forward(self, examples: List[dict] = None, **kwargs) -> Tuple:
+        batch_images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        actions = [example["action"] for example in examples]
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = qwenvl_outputs.hidden_states[self.vlm_hidden_state_index]
+            if not torch.isfinite(last_hidden).all():
+                raise FloatingPointError("GR00T_N1_7 last_hidden has NaN or Inf")
+
+        with torch.autocast("cuda", enabled=False):
+            actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
+            if not torch.isfinite(actions).all():
+                raise FloatingPointError("GR00T_N1_7 actions has NaN or Inf")
+            actions_target = actions[:, -self.action_horizon :, :]
+            repeated_diffusion_steps = (
+                self.config.framework.action_model.get("repeated_diffusion_steps", 4)
+                if self.config and hasattr(self.config, "framework")
+                else 4
+            )
+            actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+            last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+            if backbone_attention_mask is not None:
+                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
+                    dtype=torch.bool
+                )
+
+            state_repeated = None
+            if state is not None:
+                state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
+                if not torch.isfinite(state).all():
+                    raise FloatingPointError("GR00T_N1_7 state has NaN or Inf")
+                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+
+            action_loss = self.action_model(
+                last_hidden_repeated, actions_target_repeated, state_repeated,
+                encoder_attention_mask=backbone_attention_mask,
+            )
+            if not torch.isfinite(action_loss).all():
+                raise FloatingPointError("GR00T_N1_7 action_loss has NaN or Inf")
+
+        return {"action_loss": action_loss}
+
+    @torch.inference_mode()
+    def predict_action(self, examples: List[dict], **kwargs) -> np.ndarray:
+        if type(examples) is not list:
+            examples = [examples]
+        batch_images = [to_pil_preserve(example["image"]) for example in examples]
+        instructions = [example["lang"] for example in examples]
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = qwenvl_outputs.hidden_states[self.vlm_hidden_state_index]
+
+        state = (
+            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
+            if state is not None
+            else None
+        )
+
+        with torch.autocast("cuda", enabled=False):
+            pred_actions = self.action_model.predict_action(
+                last_hidden, state, encoder_attention_mask=backbone_attention_mask
+            )
+
+        normalized_actions = pred_actions.detach().cpu().numpy()
+        return {"normalized_actions": normalized_actions}
 
     def _load_gr00t_n1_7_pretrained(self):
         load_cfg = _cfg_get(self.config.framework, "gr00t_n1_7", None)
@@ -151,15 +263,26 @@ class GR00T_N1_7(Cosmos_GR00T):
         model_state = self.state_dict()
         load_state = {}
         bad_weights = []
+        loaded_rows = []
+        skipped_prefix_rows = []
         seen = 0
         skipped_missing = 0
         skipped_shape = 0
         skipped_prefix = 0
         skipped_non_tensor = 0
+        log_limit = int(os.environ.get("GR00T_LOAD_LOG_LIMIT", "80"))
+
+        _rank0_print(
+            "[GR00T_N1_7] strict load start: "
+            f"checkpoint={checkpoint_path}, prefixes={prefixes}, files={len(files)}"
+        )
+        for file_path in files:
+            _rank0_print(f"[GR00T_N1_7] load file: {file_path}")
 
         for file_path in files:
             state = _load_state_file(file_path)
             if not isinstance(state, dict):
+                bad_weights.append(f"{file_path}: checkpoint object is {type(state).__name__}, not dict")
                 continue
 
             for raw_key, tensor in state.items():
@@ -167,6 +290,7 @@ class GR00T_N1_7(Cosmos_GR00T):
                 key = _normalize_key(raw_key)
                 if not _prefix_ok(key, prefixes):
                     skipped_prefix += 1
+                    skipped_prefix_rows.append(f"{raw_key} -> {key}")
                     continue
                 if not torch.is_tensor(tensor):
                     skipped_non_tensor += 1
@@ -184,11 +308,16 @@ class GR00T_N1_7(Cosmos_GR00T):
                     )
                     continue
                 load_state[key] = tensor
+                loaded_rows.append(f"{raw_key} -> {key}: shape={tuple(tensor.shape)}")
 
-        expected_keys = {key for key in model_state if _prefix_ok(key, prefixes)}
-        missing_from_checkpoint = sorted(expected_keys - set(load_state))
-        if missing_from_checkpoint:
-            bad_weights.extend(f"{key}: missing from checkpoint" for key in missing_from_checkpoint[:20])
+        _rank0_print(
+            "[GR00T_N1_7] strict load summary: "
+            f"seen={seen}, loaded={len(load_state)}, skipped_prefix={skipped_prefix}, "
+            f"missing={skipped_missing}, shape_mismatch={skipped_shape}, non_tensor={skipped_non_tensor}"
+        )
+        _print_sample("loaded", loaded_rows, log_limit)
+        _print_sample("skipped by prefix", skipped_prefix_rows, log_limit)
+        _print_sample("bad weights", bad_weights, log_limit)
 
         if bad_weights:
             sample = "\n  ".join(bad_weights[:20])

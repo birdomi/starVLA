@@ -12,19 +12,20 @@ export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export WANDB_MODE=${WANDB_MODE:-disabled}
+export GR00T_LOAD_LOG_LIMIT=${GR00T_LOAD_LOG_LIMIT:-800}
 
 Framework_name=${Framework_name:-GR00T_N1_7}
 freeze_module_list=${freeze_module_list:-qwen_vl_interface}
-base_vlm=${base_vlm:-playground/Pretrained_models/nvidia/Cosmos-Reason2-2B}
+base_vlm=${base_vlm:-nvidia/Cosmos-Reason2-2B}
 attn_implementation=${attn_implementation:-sdpa}
 config_yaml=${config_yaml:-./examples/HUMANOIDGEN/train_files/starvla_train_humanoidgen.yaml}
 data_root_dir=${data_root_dir:-${HUMANOIDGEN_DATA:-playground/Datasets/HUMANOIDGEN_DATA}}
 data_mix=${data_mix:-humanoidgen_all}
 run_root_dir=${run_root_dir:-./playground/Checkpoints}
 run_id=${run_id:-humanoidgen_gr00t_n1_7}
-per_device_batch_size=${per_device_batch_size:-16}
+per_device_batch_size=${per_device_batch_size:-32}
 video_backend=${video_backend:-pyav}
-max_train_steps=${max_train_steps:-150000}
+max_train_steps=${max_train_steps:-100000}
 save_interval=${save_interval:-10000}
 
 action_model_type=${action_model_type:-DiT-L}
@@ -33,9 +34,11 @@ action_dim=${action_dim:-26}
 state_dim=${state_dim:-26}
 action_horizon=${action_horizon:-16}
 repeated_diffusion_steps=${repeated_diffusion_steps:-4}
+dit_num_layers=${dit_num_layers:-32}
+vlm_hidden_state_index=${vlm_hidden_state_index:-16}
 
 gr00t_pretrained_path=${gr00t_pretrained_path:-playground/Pretrained_models/GR00T-N1.7}
-gr00t_load_prefixes=${gr00t_load_prefixes:-action_model}
+gr00t_load_prefixes=${gr00t_load_prefixes:-qwen_vl_interface.model,action_model.model}
 
 if [[ ! -e "${gr00t_pretrained_path}" ]]; then
   echo "[ERROR] GR00T N1.7 checkpoint not found: ${gr00t_pretrained_path}" >&2
@@ -74,8 +77,10 @@ accelerate launch \
   --framework.action_model.state_dim "${state_dim}" \
   --framework.action_model.action_horizon "${action_horizon}" \
   --framework.action_model.repeated_diffusion_steps "${repeated_diffusion_steps}" \
+  --framework.action_model.diffusion_model_cfg.num_layers "${dit_num_layers}" \
   --framework.gr00t_n1_7.checkpoint_path "${gr00t_pretrained_path}" \
   --framework.gr00t_n1_7.load_prefixes "${gr00t_load_prefixes}" \
+  --framework.gr00t_n1_7.vlm_hidden_state_index "${vlm_hidden_state_index}" \
   --datasets.vla_data.data_root_dir "${data_root_dir}" \
   --datasets.vla_data.data_mix "${data_mix}" \
   --datasets.vla_data.per_device_batch_size "${per_device_batch_size}" \
